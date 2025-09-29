@@ -1,0 +1,350 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Mapillary: HKocen (viewport loader, resilient bbox, 5k cap)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- MapillaryJS -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
+  <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
+
+  <!-- MapLibre GL -->
+  <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #wrap { position: relative; height: 100vh; width: 100%; }
+    #viewer, #map { position: absolute; top: 0; height: 100%; }
+    #viewer { left: 0; width: 61.8%; }
+    #map    { right: 0; width: calc(38.2% - 2px); }
+    #msg {
+      position: absolute; left: 8px; top: 8px; z-index: 1000;
+      background: rgba(0,0,0,.72); color:#fff; padding:6px 10px; border-radius:6px;
+      font: 13px/1.3 system-ui, sans-serif; white-space: pre-line;
+      max-width: min(52vw, 780px);
+    }
+    #msg.error { background: rgba(160,0,0,.85); }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="viewer"></div>
+    <div id="map"></div>
+    <div id="msg">Loading…</div>
+  </div>
+
+  <script>
+    // =========================
+    // CONFIG
+    // =========================
+    const TOKEN     = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
+    const START_ID  = "744575191439794";
+    const USERNAME  = "HKocen";
+
+    // Date filter: default 2025-06-01, override via ?after=YYYY-MM-DD
+    const qs = new URLSearchParams(location.search);
+    const afterParam = qs.get("after");
+    const DEFAULT_AFTER = "2025-06-01";
+    const afterDateStr = /^\d{4}-\d{2}-\d{2}$/.test(afterParam || "") ? afterParam : DEFAULT_AFTER;
+    const CUTOFF_ISO = afterDateStr + "T00:00:00Z";
+
+    // Viewport loader tuning
+    const MIN_ZOOM_FOR_PINS = 16;     // don’t fetch until zoomed in
+    const MAX_VIEW_RESULTS  = 5000;   // cap per refresh
+    const PAGE_LIMIT        = 1000;   // per-page request
+    const TARGET_MAX_AREA   = 0.00009;// aim for < 1e-4 deg² per tile
+    const MIN_AREA          = 1e-7;   // stop splitting below this (~ strict tiny)
+    const MAX_TILES         = 256;    // hard cap on number of tiles queued
+    const CONCURRENCY       = 6;      // parallel tile fetches
+    const DEBOUNCE_MS       = 250;    // map move debounce
+
+    // =========================
+    // STATUS / HELPERS
+    // =========================
+    const $msg = document.getElementById("msg");
+    const status = (t, err=false)=>{ $msg.textContent=t||""; $msg.classList.toggle("error",!!err); };
+
+    const clampLon = x => Math.max(-180, Math.min(180, x));
+    const clampLat = y => Math.max(-85,  Math.min(85,  y));
+
+    function bboxFromMap(m) {
+      const b = m.getBounds();
+      const w = clampLon(b.getWest());
+      const s = clampLat(b.getSouth());
+      const e = clampLon(b.getEast());
+      const n = clampLat(b.getNorth());
+      return [w,s,e,n];
+    }
+    const bboxArea = ([w,s,e,n]) => Math.max(0,e-w) * Math.max(0,n-s);
+    const splitBbox = ([w,s,e,n]) => {
+      const mx = (w+e)/2, my = (s+n)/2;
+      return [[w,s,mx,my],[mx,s,e,my],[w,my,mx,n],[mx,my,e,n]];
+    };
+
+    // =========================
+    // MAPILLARY VIEWER (LEFT)
+    // =========================
+    const viewer = new mapillary.Viewer({
+      container: "viewer",
+      accessToken: TOKEN,
+      imageId: START_ID,
+      component: { cover: false, direction: true, zoom: true, attribution: true }
+    });
+
+    // =========================
+    // MAP (RIGHT)
+    // =========================
+    const OSM_RASTER_STYLE = {
+      "version": 8,
+      "name": "OSM Raster",
+      "glyphs": "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+      "sources": {
+        "osm": {
+          "type": "raster",
+          "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+          "tileSize": 256, "minzoom": 0, "maxzoom": 19,
+          "attribution": "© OpenStreetMap contributors"
+        }
+      },
+      "layers": [
+        { "id": "bg", "type": "background", "paint": { "background-color": "#e6f2d8" } },
+        { "id": "osm", "type": "raster", "source": "osm" }
+      ]
+    };
+
+    const map = new maplibregl.Map({
+      container: "map",
+      style: OSM_RASTER_STYLE,
+      center: [-91.965153, 30.138307],
+      zoom: 16
+    });
+
+    // Small viewer position & camera indicator on the map
+    function makeArcPath(fovDeg){
+      const r=45,cx=50,cy=50,rad=Math.PI/180*fovDeg,a0=-Math.PI/2-rad/2,a1=a0+rad;
+      const x0=cx+r*Math.cos(a0),y0=cy+r*Math.sin(a0),x1=cx+r*Math.cos(a1),y1=cy+r*Math.sin(a1);
+      return `M ${cx} ${cy} L ${x0} ${y0} A ${r} ${r} 0 0 1 ${x1} ${y1} Z`;
+    }
+    function makeCamera(bearingDeg,fovDeg){
+      const path=document.createElementNS('http://www.w3.org/2000/svg','path');
+      path.setAttribute('d',makeArcPath(fovDeg)); path.setAttribute('fill','yellow'); path.setAttribute('fill-opacity','0.5');
+      path.setAttribute('stroke','black'); path.setAttribute('stroke-width','1'); path.setAttribute('stroke-linejoin','round');
+      const svg=document.createElementNS('http://www.w3.org/2000/svg','svg'); svg.setAttribute('viewBox','0 0 100 100'); svg.appendChild(path);
+      svg.style.height='100%'; svg.style.width='100%'; svg.style.transform=`rotateZ(${bearingDeg}deg)`;
+      const el=document.createElement('div'); el.style.height='200px'; el.style.width='200px'; el.appendChild(svg); return el;
+    }
+    const cameraEl = makeCamera(0,90);
+    const cameraMarker = new maplibregl.Marker({ element: cameraEl, rotationAlignment:"map" });
+    const posDot = document.createElement('div'); posDot.style.cssText="width:14px;height:14px;border:3px solid #ff2a6d;border-radius:50%;background:#fff9";
+    const positionMarker = new maplibregl.Marker({ element: posDot, rotationAlignment:"map" });
+
+    async function syncPosition(){
+      try{
+        const p = await viewer.getPosition();
+        const pov = await viewer.getPointOfView();
+        positionMarker.setLngLat([p.lng,p.lat]).addTo(map);
+        cameraMarker.setLngLat([p.lng,p.lat]).addTo(map);
+        cameraEl.querySelector('svg').style.transform=`rotateZ(${pov.bearing}deg)`;
+      }catch{}
+    }
+    viewer.on('load', syncPosition);
+    viewer.on('image', syncPosition);
+    viewer.on('position', syncPosition);
+    viewer.on('pov', syncPosition);
+
+    // =========================
+    // VIEWPORT PIN LOADER (resilient bbox)
+    // =========================
+    let currentAbort = null;
+
+    function ensurePinsLayer(){
+      if (!map.getSource("pins")) {
+        map.addSource("pins", { type:"geojson", data:{ type:"FeatureCollection", features:[] } });
+        map.addLayer({
+          id:"pins-dots", type:"circle", source:"pins",
+          paint:{
+            "circle-color":"#1b5e20", "circle-opacity":0.95,
+            "circle-radius":["interpolate",["linear"],["zoom"],3,2,8,3,12,4,19,6],
+            "circle-stroke-width":2, "circle-stroke-color":"#9cff9c"
+          }
+        });
+        map.on("click","pins-dots",(e)=>{
+          const f = map.queryRenderedFeatures(e.point,{ layers:["pins-dots"] })[0];
+          if (f?.properties?.id) viewer.moveTo(f.properties.id).catch(()=>{});
+        });
+        map.on("mouseenter","pins-dots",()=> map.getCanvas().style.cursor="pointer");
+        map.on("mouseleave","pins-dots",()=> map.getCanvas().style.cursor="");
+      }
+    }
+
+    function buildTileURL(bbox, limit){
+      const [w,s,e,n] = bbox.map(v=> +v.toFixed(7)); // clean numbers
+      const u = new URL("https://graph.mapillary.com/images");
+      u.searchParams.set("fields","id,computed_geometry,captured_at,creator");
+      u.searchParams.set("creator_username", USERNAME);
+      u.searchParams.set("start_captured_at", CUTOFF_ISO);
+      u.searchParams.set("bbox", `${w},${s},${e},${n}`); // west,south,east,north
+      u.searchParams.set("limit", String(limit));
+      u.searchParams.set("access_token", TOKEN);
+      return u;
+    }
+
+    // Detect bbox-related errors we can fix by subdividing further
+    function isBboxTooLargeError(txt){
+      const t = (txt||"").toLowerCase();
+      return t.includes("bounding box area is too large")
+          || t.includes("maximum allowed area")
+          || t.includes("bbox")
+          || t.includes("determine coordinates");
+    }
+
+    async function fetchTile(bbox, cap, signal){
+      let out = [];
+      let url = buildTileURL(bbox, Math.min(PAGE_LIMIT, cap));
+      while (url && out.length < cap) {
+        const res = await fetch(url, { signal });
+        if (!res.ok) {
+          const txt = await res.text().catch(()=>res.statusText);
+          throw new Error(txt || `HTTP ${res.status}`);
+        }
+        const j = await res.json();
+        const data = Array.isArray(j.data) ? j.data : [];
+        for (const d of data) {
+          const c = d?.computed_geometry?.coordinates;
+          const creatorName = d?.creator?.username || "";
+          if (!Array.isArray(c) || c.length!==2) continue;
+          if (creatorName && creatorName !== USERNAME) continue;
+          out.push({ id:d.id, lng:c[0], lat:c[1] });
+          if (out.length >= cap) break;
+        }
+        const next = j?.paging?.next;
+        if (next && out.length < cap) {
+          url = new URL(next);
+          if (!url.searchParams.get("access_token"))      url.searchParams.set("access_token", TOKEN);
+          if (!url.searchParams.get("creator_username"))  url.searchParams.set("creator_username", USERNAME);
+          if (!url.searchParams.get("fields"))            url.searchParams.set("fields","id,computed_geometry,captured_at,creator");
+          if (!url.searchParams.get("start_captured_at")) url.searchParams.set("start_captured_at", CUTOFF_ISO);
+        } else {
+          url = null;
+        }
+      }
+      return out;
+    }
+
+    async function loadPinsForView(){
+      if (map.getZoom() < MIN_ZOOM_FOR_PINS) {
+        status(`Zoom in to ≥ ${MIN_ZOOM_FOR_PINS} to load pins.\nAfter: ${CUTOFF_ISO}`);
+        if (map.getSource("pins")) map.getSource("pins").setData({ type:"FeatureCollection", features:[] });
+        return;
+      }
+
+      // Cancel any previous run
+      if (currentAbort) currentAbort.abort();
+      currentAbort = new AbortController();
+      const { signal } = currentAbort;
+
+      ensurePinsLayer();
+
+      // Build initial tile set (handles dateline wrap)
+      let view = bboxFromMap(map);
+      const initialTiles = (() => {
+        const [w,s,e,n] = view;
+        if (e < w) {
+          return [...tileBboxes([w,s,180,n]), ...tileBboxes([-180,s,e,n])];
+        } else {
+          return tileBboxes(view);
+        }
+      })();
+
+      function tileBboxes(bbox){
+        const out = [];
+        const q = [bbox];
+        while (q.length && out.length < MAX_TILES) {
+          const b = q.shift();
+          if (bboxArea(b) <= TARGET_MAX_AREA) { out.push(b); continue; }
+          // Split until small enough or we reach MAX_TILES
+          const kids = splitBbox(b);
+          for (const k of kids) q.push(k);
+        }
+        return out;
+      }
+
+      status(`Loading in-view pins… tiles: ${initialTiles.length}\nAfter: ${CUTOFF_ISO}`);
+
+      const queue = [...initialTiles];
+      let remaining = MAX_VIEW_RESULTS;
+      const seen = new Set();
+      const results = [];
+
+      async function processTile(b){
+        if (signal.aborted || remaining<=0) return;
+        try {
+          const capForTile = Math.min(PAGE_LIMIT, remaining);
+          const items = await fetchTile(b, capForTile, signal);
+          for (const it of items) {
+            if (seen.has(it.id)) continue;
+            seen.add(it.id);
+            results.push(it);
+            remaining = Math.max(0, remaining - 1);
+            if (remaining === 0) break;
+          }
+        } catch (e) {
+          if (signal.aborted) return;
+          const msg = (e && e.message) || String(e);
+          // If the server rejects the bbox, split this tile further (until tiny)
+          if (isBboxTooLargeError(msg) && bboxArea(b) > MIN_AREA && queue.length < MAX_TILES) {
+            const kids = splitBbox(b);
+            for (const k of kids) queue.push(k);
+          } else {
+            // Non-recoverable: just log
+            console.warn("Tile failed:", msg);
+          }
+        }
+      }
+
+      // Simple worker pool with dynamic queue + live status
+      let tick = 0;
+      async function worker(){
+        while (!signal.aborted && remaining>0 && queue.length) {
+          const tile = queue.shift();
+          await processTile(tile);
+          tick++;
+          if (tick % 3 === 0) {
+            status(`Loading… ${results.length} / ${MAX_VIEW_RESULTS}\nQueue: ${queue.length} tiles`);
+          }
+        }
+      }
+      const workers = Array.from({length: Math.min(CONCURRENCY, queue.length)}, worker);
+      await Promise.all(workers).catch(()=>{});
+
+      // Push to map
+      const feats = results.map(r => ({
+        type:"Feature", geometry:{ type:"Point", coordinates:[r.lng,r.lat] }, properties:{ id:r.id }
+      }));
+      map.getSource("pins").setData({ type:"FeatureCollection", features:feats });
+
+      const capped = results.length >= MAX_VIEW_RESULTS ? " (capped)" : "";
+      status(`Showing ${results.length} pins${capped} in view.\nAfter: ${CUTOFF_ISO}`);
+    }
+
+    // Debounce refreshes on move/zoom
+    let refreshTimer=null;
+    function triggerRefresh(){ clearTimeout(refreshTimer); refreshTimer=setTimeout(loadPinsForView, DEBOUNCE_MS); }
+    map.on("moveend", triggerRefresh);
+    map.on("zoomend", triggerRefresh);
+    map.on("load", loadPinsForView);
+
+    // Optional: nudge map toward the current image on first load
+    viewer.on("image", async ()=>{
+      try{
+        const p = await viewer.getPosition();
+        if (!map.getBounds().pad(-0.2).contains([p.lng,p.lat])) {
+          map.easeTo({ center:[p.lng,p.lat], zoom: Math.max(map.getZoom(), MIN_ZOOM_FOR_PINS) });
+        }
+      }catch{}
+    });
+  </script>
+</body>
+</html>
