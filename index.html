@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary: HKocen (viewport tiles, 5k cap, no clustering)</title>
+  <title>Mapillary tiles → live pins + viewer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -25,7 +25,6 @@
       font: 13px/1.3 system-ui, sans-serif; white-space: pre-line;
       max-width: min(52vw, 780px);
     }
-    #msg.error { background: rgba(160,0,0,.85); }
   </style>
 </head>
 <body>
@@ -36,95 +35,19 @@
   </div>
 
   <script>
-    // =========================
-    // CONFIG
-    // =========================
-    const TOKEN     = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
-    const START_ID  = "744575191439794";
-    const USERNAME  = "HKocen";
+    // --- Replace with your values ---
+    const TOKEN    = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
+    const START_ID = "744575191439794";   // initial image for the viewer
 
-    // Date filter: default 2025-06-01, override via ?after=YYYY-MM-DD
-    const qs = new URLSearchParams(location.search);
-    const afterParam = qs.get("after");
-    const DEFAULT_AFTER = "2025-06-01";
-    const afterDateStr = /^\d{4}-\d{2}-\d{2}$/.test(afterParam || "") ? afterParam : DEFAULT_AFTER;
-    const CUTOFF_ISO = afterDateStr + "T00:00:00Z";
-
-    // Viewport loader tuning
-    const MIN_ZOOM_FOR_PINS = 16;   // don’t fetch until zoomed in
-    const MAX_VIEW_RESULTS  = 5000; // cap per refresh (across all tiles)
-    const PAGE_LIMIT        = 1000; // per-request page size
-    const CONCURRENCY       = 6;    // parallel tile fetches
-    const DEBOUNCE_MS       = 250;  // move/zoom debounce
-
-    // Mercator tiling
-    const TILE_Z = 20;              // tiny tiles => tiny bboxes
-    const MAX_TILES = 1024;         // safety cap
-
-    // =========================
-    // STATUS / HELPERS
-    // =========================
-    const $msg = document.getElementById("msg");
-    const status = (t, isErr=false)=>{ $msg.textContent=t||""; $msg.classList.toggle("error", !!isErr); };
-
-    const clampLon = x => Math.max(-180, Math.min(180, x));
-    const clampLat = y => Math.max(-85,  Math.min(85,  y));
-
-    function bboxFromMap(m) {
-      const b = m.getBounds();
-      return [clampLon(b.getWest()), clampLat(b.getSouth()), clampLon(b.getEast()), clampLat(b.getNorth())];
-    }
-
-    // ---- Web Mercator tile helpers (mercantile-style) ----
-    function long2tilex(lon, z){ return Math.floor((lon + 180) / 360 * (1 << z)); }
-    function lat2tiley(lat, z){
-      const rad = lat * Math.PI / 180;
-      return Math.floor((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2 * (1 << z));
-    }
-    function tilex2long(x, z){ return x / (1 << z) * 360 - 180; }
-    function tiley2lat(y, z){
-      const n = Math.PI - 2 * Math.PI * y / (1 << z);
-      return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
-    }
-    // Return an array of [w,s,e,n] for all z=Z tiles intersecting bbox; handles dateline wrap
-    function viewTilesAsBboxes([w,s,e,n], z) {
-      const parts = e < w ? [[w,s,180,n], [-180,s,e,n]] : [[w,s,e,n]];
-      const out = [];
-      for (const [W,S,E,N] of parts) {
-        const x0 = long2tilex(W, z), x1 = long2tilex(E, z);
-        const y0 = lat2tiley(N, z), y1 = lat2tiley(S, z);
-        for (let x = x0; x <= x1; x++) {
-          for (let y = y0; y <= y1; y++) {
-            const west  = tilex2long(x, z);
-            const east  = tilex2long(x + 1, z);
-            const north = tiley2lat(y, z);
-            const south = tiley2lat(y + 1, z);
-            // nudge edges so we never hand the API a zero-area bbox
-            const w2 = Math.max(-180, Math.min(180, west  + 1e-12));
-            const e2 = Math.max(-180, Math.min(180, east  - 1e-12));
-            const s2 = Math.max(-85,  Math.min(85,  south + 1e-12));
-            const n2 = Math.max(-85,  Math.min(85,  north - 1e-12));
-            if (e2 > w2 && n2 > s2) out.push([w2, s2, e2, n2]);
-            if (out.length >= MAX_TILES) return out;
-          }
-        }
-      }
-      return out;
-    }
-
-    // =========================
-    // MAPILLARY VIEWER (LEFT)
-    // =========================
+    // --- Mapillary viewer (left) ---
     const viewer = new mapillary.Viewer({
       container: "viewer",
       accessToken: TOKEN,
       imageId: START_ID,
-      component: { cover: false, direction: true, zoom: true, attribution: true }
+      component: { cover:false, direction:true, zoom:true, attribution:true }
     });
 
-    // =========================
-    // MAP (RIGHT)
-    // =========================
+    // --- Base map (right) ---
     const OSM_RASTER_STYLE = {
       "version": 8,
       "name": "OSM Raster",
@@ -135,10 +58,19 @@
           "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
           "tileSize": 256, "minzoom": 0, "maxzoom": 19,
           "attribution": "© OpenStreetMap contributors"
+        },
+        // Mapillary vector tiles (mly1_public)
+        "mapillary": {
+          "type": "vector",
+          "tiles": [
+            "https://tiles.mapillary.com/maps/vtp/mly1_public/2/{z}/{x}/{y}?access_token=" + encodeURIComponent(TOKEN)
+          ],
+          "minzoom": 0,
+          "maxzoom": 14
         }
       },
       "layers": [
-        { "id": "bg", "type": "background", "paint": { "background-color": "#e6f2d8" } },
+        { "id": "bg",  "type": "background", "paint": { "background-color": "#e6f2d8" } },
         { "id": "osm", "type": "raster", "source": "osm" }
       ]
     };
@@ -147,10 +79,90 @@
       container: "map",
       style: OSM_RASTER_STYLE,
       center: [-91.965153, 30.138307],
-      zoom: 16
+      zoom: 15
     });
 
-    // Viewer position indicator (nice-to-have)
+    const $msg = document.getElementById("msg");
+    const status = (t)=>{ $msg.textContent = t || ""; };
+
+    map.on("load", () => {
+      // Sequence lines (nice context at mid/high zoom)
+      map.addLayer({
+        id: "mly-sequences",
+        type: "line",
+        source: "mapillary",
+        "source-layer": "sequence",
+        minzoom: 13,
+        paint: {
+          "line-color": "#1976d2",
+          "line-opacity": 0.7,
+          "line-width": [
+            "interpolate", ["linear"], ["zoom"],
+            13, 1.0,
+            17, 2.5
+          ]
+        }
+      });
+
+      // Image points (the “pins”) – available from z>=14
+      map.addLayer({
+        id: "mly-images",
+        type: "circle",
+        source: "mapillary",
+        "source-layer": "image",
+        minzoom: 14,
+        paint: {
+          "circle-color": "#1b5e20",
+          "circle-opacity": 0.95,
+          "circle-radius": [
+            "interpolate", ["linear"], ["zoom"],
+            14, 2.5,
+            18, 5.0
+          ],
+          "circle-stroke-width": 2,
+          "circle-stroke-color": "#b6ffb6"
+        }
+      });
+
+      status("Click a green dot to open it in the viewer.");
+
+      map.on("mouseenter", "mly-images", () => map.getCanvas().style.cursor = "pointer");
+      map.on("mouseleave", "mly-images", () => map.getCanvas().style.cursor = "");
+
+      // Click-to-open behavior
+      map.on("click", "mly-images", async (e) => {
+        const f = e.features && e.features[0];
+        if (!f) return;
+
+        // Try to get an ID straight off the tile feature (common: 'id' or 'image_id')
+        const id = f.properties?.id || f.properties?.image_id;
+        if (id) {
+          try { await viewer.moveTo(String(id)); } catch {}
+          return;
+        }
+
+        // Fallback: find the nearest image via Graph API and open it
+        const [lng, lat] = f.geometry.coordinates;
+        try {
+          const u = new URL("https://graph.mapillary.com/images");
+          u.searchParams.set("fields", "id");
+          u.searchParams.set("closeto", `${lng},${lat}`);
+          u.searchParams.set("radius", "25");
+          u.searchParams.set("limit", "1");
+          u.searchParams.set("access_token", TOKEN);
+          const r = await fetch(u);
+          if (r.ok) {
+            const j = await r.json();
+            const got = j?.data?.[0]?.id;
+            if (got) await viewer.moveTo(String(got));
+          }
+        } catch(e) {
+          console.warn("Nearest lookup failed:", e);
+        }
+      });
+    });
+
+    // Keep a tiny marker/wedge on the map for the current viewer position (optional)
     function makeArcPath(fovDeg){
       const r=45,cx=50,cy=50,rad=Math.PI/180*fovDeg,a0=-Math.PI/2-rad/2,a1=a0+rad;
       const x0=cx+r*Math.cos(a0),y0=cy+r*Math.sin(a0),x1=cx+r*Math.cos(a1),y1=cy+r*Math.sin(a1);
@@ -164,10 +176,10 @@
       svg.style.height='100%'; svg.style.width='100%'; svg.style.transform=`rotateZ(${bearingDeg}deg)`;
       const el=document.createElement('div'); el.style.height='200px'; el.style.width='200px'; el.appendChild(svg); return el;
     }
-    const cameraEl = makeCamera(0,90);
-    const cameraMarker = new maplibregl.Marker({ element: cameraEl, rotationAlignment:"map" });
+    const cameraEl = makeCamera(0, 90);
+    const cameraMarker = new maplibregl.Marker({ element: cameraEl, rotationAlignment: "map" });
     const posDot = document.createElement('div'); posDot.style.cssText="width:14px;height:14px;border:3px solid #ff2a6d;border-radius:50%;background:#fff9";
-    const positionMarker = new maplibregl.Marker({ element: posDot, rotationAlignment:"map" });
+    const positionMarker = new maplibregl.Marker({ element: posDot, rotationAlignment: "map" });
 
     async function syncPosition(){
       try{
@@ -182,170 +194,14 @@
     viewer.on('image', syncPosition);
     viewer.on('position', syncPosition);
     viewer.on('pov', syncPosition);
-
-    // =========================
-    // VIEWPORT PIN LOADER (XYZ tiles)
-    // =========================
-    let currentAbort = null;
-
-    function ensurePinsLayer(){
-      if (!map.getSource("pins")) {
-        map.addSource("pins", { type:"geojson", data:{ type:"FeatureCollection", features:[] } });
-        map.addLayer({
-          id:"pins-dots", type:"circle", source:"pins",
-          paint:{
-            "circle-color":"#1b5e20", "circle-opacity":0.95,
-            "circle-radius":["interpolate",["linear"],["zoom"],3,2,8,3,12,4,19,6],
-            "circle-stroke-width":2, "circle-stroke-color":"#9cff9c"
-          }
-        });
-        map.on("click","pins-dots",(e)=>{
-          const f = map.queryRenderedFeatures(e.point,{ layers:["pins-dots"] })[0];
-          if (f?.properties?.id) viewer.moveTo(f.properties.id).catch(()=>{});
-        });
-        map.on("mouseenter","pins-dots",()=> map.getCanvas().style.cursor="pointer");
-        map.on("mouseleave","pins-dots",()=> map.getCanvas().style.cursor="");
-      }
-    }
-
-    function buildTileURL(bbox, limit){
-      const [w,s,e,n] = bbox.map(v=> +v.toFixed(7));
-      const u = new URL("https://graph.mapillary.com/images");
-      u.searchParams.set("fields","id,computed_geometry,captured_at,creator");
-      u.searchParams.set("creator_username", USERNAME);
-      u.searchParams.set("start_captured_at", CUTOFF_ISO);
-      u.searchParams.set("bbox", `${w},${s},${e},${n}`); // west,south,east,north
-      u.searchParams.set("limit", String(limit));
-      u.searchParams.set("access_token", TOKEN);
-      return u;
-    }
-
-    async function fetchTile(bbox, cap, signal){
-  // Keep one clean bbox string we can re-attach on every page
-  const bboxStr = bbox.map(v => +v.toFixed(7)).join(',');
-  let out = [];
-
-  // First page
-  let url = new URL("https://graph.mapillary.com/images");
-  url.searchParams.set("fields", "id,computed_geometry,captured_at,creator");
-  url.searchParams.set("creator_username", USERNAME);
-  url.searchParams.set("start_captured_at", CUTOFF_ISO);
-  url.searchParams.set("bbox", bboxStr); // west,south,east,north
-  url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, cap)));
-  url.searchParams.set("access_token", TOKEN);
-
-  while (url && out.length < cap) {
-    const res = await fetch(url, { signal });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => res.statusText);
-      throw new Error(`${res.status} ${txt}`);
-    }
-
-    const j = await res.json();
-    const data = Array.isArray(j.data) ? j.data : [];
-    for (const d of data) {
-      const c = d?.computed_geometry?.coordinates;
-      const creatorName = d?.creator?.username || "";
-      if (!Array.isArray(c) || c.length !== 2) continue;
-      if (creatorName && creatorName !== USERNAME) continue; // extra guard
-      out.push({ id: d.id, lng: c[0], lat: c[1] });
-      if (out.length >= cap) break;
-    }
-
-    // Follow next page, but PUT BACK the filters the API drops (especially bbox)
-    const next = j?.paging?.next;
-    if (next && out.length < cap) {
-      url = new URL(next);
-
-      // persist critical filters
-      if (!url.searchParams.get("access_token"))      url.searchParams.set("access_token", TOKEN);
-      if (!url.searchParams.get("creator_username"))  url.searchParams.set("creator_username", USERNAME);
-      if (!url.searchParams.get("fields"))            url.searchParams.set("fields", "id,computed_geometry,captured_at,creator");
-      if (!url.searchParams.get("start_captured_at")) url.searchParams.set("start_captured_at", CUTOFF_ISO);
-      if (!url.searchParams.get("bbox"))              url.searchParams.set("bbox", bboxStr);
-
-      // tighten the page size to only what we still need
-      const remaining = cap - out.length;
-      url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, remaining)));
-    } else {
-      url = null;
-    }
-  }
-  return out;
-}
-
-    async function loadPinsForView(){
-      if (map.getZoom() < MIN_ZOOM_FOR_PINS) {
-        status(`Zoom in to ≥ ${MIN_ZOOM_FOR_PINS} to load pins.\nAfter: ${CUTOFF_ISO}`);
-        if (map.getSource("pins")) map.getSource("pins").setData({ type:"FeatureCollection", features:[] });
-        return;
-      }
-
-      // Cancel any previous run
-      if (currentAbort) currentAbort.abort();
-      currentAbort = new AbortController();
-      const { signal } = currentAbort;
-
-      ensurePinsLayer();
-
-      // Build XYZ tiles for the current view at z=20
-      const tiles = viewTilesAsBboxes(bboxFromMap(map), TILE_Z);
-      status(`Loading pins in view… tiles: ${tiles.length}\nAfter: ${CUTOFF_ISO}`);
-
-      const seen = new Set();
-      const results = [];
-      let remaining = MAX_VIEW_RESULTS;
-
-      let idx = 0;
-      async function worker(){
-        while (!signal.aborted && remaining > 0 && idx < tiles.length) {
-          const my = idx++;
-          const capForTile = Math.min(PAGE_LIMIT, remaining);
-          try {
-            const items = await fetchTile(tiles[my], capForTile, signal);
-            for (const it of items) {
-              if (seen.has(it.id)) continue;
-              seen.add(it.id);
-              results.push(it);
-              remaining = Math.max(0, remaining - 1);
-              if (remaining === 0) break;
-            }
-            if (my % 3 === 0) status(`Loading… ${results.length} / ${MAX_VIEW_RESULTS}\nTile ${my+1}/${tiles.length}`);
-          } catch (e) {
-            if (signal.aborted) return;
-            console.warn("Tile failed:", e.message || e);
-          }
-        }
-      }
-      const workers = Array.from({length: Math.min(CONCURRENCY, tiles.length)}, worker);
-      await Promise.all(workers).catch(()=>{});
-
-      // Push to map
-      const features = results.map(r => ({
-        type:"Feature", geometry:{ type:"Point", coordinates:[r.lng,r.lat] }, properties:{ id:r.id }
-      }));
-      map.getSource("pins").setData({ type:"FeatureCollection", features });
-
-      const capped = results.length >= MAX_VIEW_RESULTS ? " (capped)" : "";
-      status(`Showing ${results.length} pins in view${capped}.\nAfter: ${CUTOFF_ISO}`);
-    }
-
-    // Debounced refresh on pan/zoom
-    let refreshTimer=null;
-    const triggerRefresh = ()=>{ clearTimeout(refreshTimer); refreshTimer=setTimeout(loadPinsForView, DEBOUNCE_MS); };
-    map.on("moveend", triggerRefresh);
-    map.on("zoomend", triggerRefresh);
-    map.on("load", loadPinsForView);
-
-    // Nudge map toward current image on first load
-    viewer.on("image", async ()=>{
-      try {
-        const p = await viewer.getPosition();
-        if (!map.getBounds().pad(-0.2).contains([p.lng,p.lat])) {
-          map.easeTo({ center:[p.lng,p.lat], zoom: Math.max(map.getZoom(), MIN_ZOOM_FOR_PINS) });
-        }
-      } catch {}
+    viewer.on('fov', async () => {
+      const vc = viewer.getContainer();
+      const vFov = Math.PI/180 * (await viewer.getFieldOfView());
+      const aspect = vc.offsetHeight ? vc.offsetWidth / vc.offsetHeight : 0;
+      const hFovDeg = Math.atan(aspect * Math.tan(0.5*vFov)) * 2 * 180/Math.PI;
+      cameraEl.querySelector('path').setAttribute('d', makeArcPath(hFovDeg));
     });
+    window.addEventListener('resize', ()=>viewer.emit && viewer.emit('fov'));
   </script>
 </body>
 </html>
