@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary: HKocen (viewport loader, resilient bbox, 5k cap)</title>
+  <title>Mapillary: HKocen (viewport tiles, 5k cap, no clustering)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -51,37 +51,66 @@
     const CUTOFF_ISO = afterDateStr + "T00:00:00Z";
 
     // Viewport loader tuning
-    const MIN_ZOOM_FOR_PINS = 16;     // don’t fetch until zoomed in
-    const MAX_VIEW_RESULTS  = 5000;   // cap per refresh
-    const PAGE_LIMIT        = 1000;   // per-page request
-    const TARGET_MAX_AREA   = 0.00009;// aim for < 1e-4 deg² per tile
-    const MIN_AREA          = 1e-7;   // stop splitting below this (~ strict tiny)
-    const MAX_TILES         = 256;    // hard cap on number of tiles queued
-    const CONCURRENCY       = 6;      // parallel tile fetches
-    const DEBOUNCE_MS       = 250;    // map move debounce
+    const MIN_ZOOM_FOR_PINS = 16;   // don’t fetch until zoomed in
+    const MAX_VIEW_RESULTS  = 5000; // cap per refresh (across all tiles)
+    const PAGE_LIMIT        = 1000; // per-request page size
+    const CONCURRENCY       = 6;    // parallel tile fetches
+    const DEBOUNCE_MS       = 250;  // move/zoom debounce
+
+    // Mercator tiling
+    const TILE_Z = 20;              // tiny tiles => tiny bboxes
+    const MAX_TILES = 1024;         // safety cap
 
     // =========================
     // STATUS / HELPERS
     // =========================
     const $msg = document.getElementById("msg");
-    const status = (t, err=false)=>{ $msg.textContent=t||""; $msg.classList.toggle("error",!!err); };
+    const status = (t, isErr=false)=>{ $msg.textContent=t||""; $msg.classList.toggle("error", !!isErr); };
 
     const clampLon = x => Math.max(-180, Math.min(180, x));
     const clampLat = y => Math.max(-85,  Math.min(85,  y));
 
     function bboxFromMap(m) {
       const b = m.getBounds();
-      const w = clampLon(b.getWest());
-      const s = clampLat(b.getSouth());
-      const e = clampLon(b.getEast());
-      const n = clampLat(b.getNorth());
-      return [w,s,e,n];
+      return [clampLon(b.getWest()), clampLat(b.getSouth()), clampLon(b.getEast()), clampLat(b.getNorth())];
     }
-    const bboxArea = ([w,s,e,n]) => Math.max(0,e-w) * Math.max(0,n-s);
-    const splitBbox = ([w,s,e,n]) => {
-      const mx = (w+e)/2, my = (s+n)/2;
-      return [[w,s,mx,my],[mx,s,e,my],[w,my,mx,n],[mx,my,e,n]];
-    };
+
+    // ---- Web Mercator tile helpers (mercantile-style) ----
+    function long2tilex(lon, z){ return Math.floor((lon + 180) / 360 * (1 << z)); }
+    function lat2tiley(lat, z){
+      const rad = lat * Math.PI / 180;
+      return Math.floor((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2 * (1 << z));
+    }
+    function tilex2long(x, z){ return x / (1 << z) * 360 - 180; }
+    function tiley2lat(y, z){
+      const n = Math.PI - 2 * Math.PI * y / (1 << z);
+      return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+    }
+    // Return an array of [w,s,e,n] for all z=Z tiles intersecting bbox; handles dateline wrap
+    function viewTilesAsBboxes([w,s,e,n], z) {
+      const parts = e < w ? [[w,s,180,n], [-180,s,e,n]] : [[w,s,e,n]];
+      const out = [];
+      for (const [W,S,E,N] of parts) {
+        const x0 = long2tilex(W, z), x1 = long2tilex(E, z);
+        const y0 = lat2tiley(N, z), y1 = lat2tiley(S, z);
+        for (let x = x0; x <= x1; x++) {
+          for (let y = y0; y <= y1; y++) {
+            const west  = tilex2long(x, z);
+            const east  = tilex2long(x + 1, z);
+            const north = tiley2lat(y, z);
+            const south = tiley2lat(y + 1, z);
+            // nudge edges so we never hand the API a zero-area bbox
+            const w2 = Math.max(-180, Math.min(180, west  + 1e-12));
+            const e2 = Math.max(-180, Math.min(180, east  - 1e-12));
+            const s2 = Math.max(-85,  Math.min(85,  south + 1e-12));
+            const n2 = Math.max(-85,  Math.min(85,  north - 1e-12));
+            if (e2 > w2 && n2 > s2) out.push([w2, s2, e2, n2]);
+            if (out.length >= MAX_TILES) return out;
+          }
+        }
+      }
+      return out;
+    }
 
     // =========================
     // MAPILLARY VIEWER (LEFT)
@@ -121,7 +150,7 @@
       zoom: 16
     });
 
-    // Small viewer position & camera indicator on the map
+    // Viewer position indicator (nice-to-have)
     function makeArcPath(fovDeg){
       const r=45,cx=50,cy=50,rad=Math.PI/180*fovDeg,a0=-Math.PI/2-rad/2,a1=a0+rad;
       const x0=cx+r*Math.cos(a0),y0=cy+r*Math.sin(a0),x1=cx+r*Math.cos(a1),y1=cy+r*Math.sin(a1);
@@ -155,7 +184,7 @@
     viewer.on('pov', syncPosition);
 
     // =========================
-    // VIEWPORT PIN LOADER (resilient bbox)
+    // VIEWPORT PIN LOADER (XYZ tiles)
     // =========================
     let currentAbort = null;
 
@@ -180,7 +209,7 @@
     }
 
     function buildTileURL(bbox, limit){
-      const [w,s,e,n] = bbox.map(v=> +v.toFixed(7)); // clean numbers
+      const [w,s,e,n] = bbox.map(v=> +v.toFixed(7));
       const u = new URL("https://graph.mapillary.com/images");
       u.searchParams.set("fields","id,computed_geometry,captured_at,creator");
       u.searchParams.set("creator_username", USERNAME);
@@ -189,15 +218,6 @@
       u.searchParams.set("limit", String(limit));
       u.searchParams.set("access_token", TOKEN);
       return u;
-    }
-
-    // Detect bbox-related errors we can fix by subdividing further
-    function isBboxTooLargeError(txt){
-      const t = (txt||"").toLowerCase();
-      return t.includes("bounding box area is too large")
-          || t.includes("maximum allowed area")
-          || t.includes("bbox")
-          || t.includes("determine coordinates");
     }
 
     async function fetchTile(bbox, cap, signal){
@@ -214,7 +234,7 @@
         for (const d of data) {
           const c = d?.computed_geometry?.coordinates;
           const creatorName = d?.creator?.username || "";
-          if (!Array.isArray(c) || c.length!==2) continue;
+          if (!Array.isArray(c) || c.length !== 2) continue;
           if (creatorName && creatorName !== USERNAME) continue;
           out.push({ id:d.id, lng:c[0], lat:c[1] });
           if (out.length >= cap) break;
@@ -247,103 +267,63 @@
 
       ensurePinsLayer();
 
-      // Build initial tile set (handles dateline wrap)
-      let view = bboxFromMap(map);
-      const initialTiles = (() => {
-        const [w,s,e,n] = view;
-        if (e < w) {
-          return [...tileBboxes([w,s,180,n]), ...tileBboxes([-180,s,e,n])];
-        } else {
-          return tileBboxes(view);
-        }
-      })();
+      // Build XYZ tiles for the current view at z=20
+      const tiles = viewTilesAsBboxes(bboxFromMap(map), TILE_Z);
+      status(`Loading pins in view… tiles: ${tiles.length}\nAfter: ${CUTOFF_ISO}`);
 
-      function tileBboxes(bbox){
-        const out = [];
-        const q = [bbox];
-        while (q.length && out.length < MAX_TILES) {
-          const b = q.shift();
-          if (bboxArea(b) <= TARGET_MAX_AREA) { out.push(b); continue; }
-          // Split until small enough or we reach MAX_TILES
-          const kids = splitBbox(b);
-          for (const k of kids) q.push(k);
-        }
-        return out;
-      }
-
-      status(`Loading in-view pins… tiles: ${initialTiles.length}\nAfter: ${CUTOFF_ISO}`);
-
-      const queue = [...initialTiles];
-      let remaining = MAX_VIEW_RESULTS;
       const seen = new Set();
       const results = [];
+      let remaining = MAX_VIEW_RESULTS;
 
-      async function processTile(b){
-        if (signal.aborted || remaining<=0) return;
-        try {
-          const capForTile = Math.min(PAGE_LIMIT, remaining);
-          const items = await fetchTile(b, capForTile, signal);
-          for (const it of items) {
-            if (seen.has(it.id)) continue;
-            seen.add(it.id);
-            results.push(it);
-            remaining = Math.max(0, remaining - 1);
-            if (remaining === 0) break;
-          }
-        } catch (e) {
-          if (signal.aborted) return;
-          const msg = (e && e.message) || String(e);
-          // If the server rejects the bbox, split this tile further (until tiny)
-          if (isBboxTooLargeError(msg) && bboxArea(b) > MIN_AREA && queue.length < MAX_TILES) {
-            const kids = splitBbox(b);
-            for (const k of kids) queue.push(k);
-          } else {
-            // Non-recoverable: just log
-            console.warn("Tile failed:", msg);
-          }
-        }
-      }
-
-      // Simple worker pool with dynamic queue + live status
-      let tick = 0;
+      let idx = 0;
       async function worker(){
-        while (!signal.aborted && remaining>0 && queue.length) {
-          const tile = queue.shift();
-          await processTile(tile);
-          tick++;
-          if (tick % 3 === 0) {
-            status(`Loading… ${results.length} / ${MAX_VIEW_RESULTS}\nQueue: ${queue.length} tiles`);
+        while (!signal.aborted && remaining > 0 && idx < tiles.length) {
+          const my = idx++;
+          const capForTile = Math.min(PAGE_LIMIT, remaining);
+          try {
+            const items = await fetchTile(tiles[my], capForTile, signal);
+            for (const it of items) {
+              if (seen.has(it.id)) continue;
+              seen.add(it.id);
+              results.push(it);
+              remaining = Math.max(0, remaining - 1);
+              if (remaining === 0) break;
+            }
+            if (my % 3 === 0) status(`Loading… ${results.length} / ${MAX_VIEW_RESULTS}\nTile ${my+1}/${tiles.length}`);
+          } catch (e) {
+            if (signal.aborted) return;
+            console.warn("Tile failed:", e.message || e);
           }
         }
       }
-      const workers = Array.from({length: Math.min(CONCURRENCY, queue.length)}, worker);
+      const workers = Array.from({length: Math.min(CONCURRENCY, tiles.length)}, worker);
       await Promise.all(workers).catch(()=>{});
 
       // Push to map
-      const feats = results.map(r => ({
+      const features = results.map(r => ({
         type:"Feature", geometry:{ type:"Point", coordinates:[r.lng,r.lat] }, properties:{ id:r.id }
       }));
-      map.getSource("pins").setData({ type:"FeatureCollection", features:feats });
+      map.getSource("pins").setData({ type:"FeatureCollection", features });
 
       const capped = results.length >= MAX_VIEW_RESULTS ? " (capped)" : "";
-      status(`Showing ${results.length} pins${capped} in view.\nAfter: ${CUTOFF_ISO}`);
+      status(`Showing ${results.length} pins in view${capped}.\nAfter: ${CUTOFF_ISO}`);
     }
 
-    // Debounce refreshes on move/zoom
+    // Debounced refresh on pan/zoom
     let refreshTimer=null;
-    function triggerRefresh(){ clearTimeout(refreshTimer); refreshTimer=setTimeout(loadPinsForView, DEBOUNCE_MS); }
+    const triggerRefresh = ()=>{ clearTimeout(refreshTimer); refreshTimer=setTimeout(loadPinsForView, DEBOUNCE_MS); };
     map.on("moveend", triggerRefresh);
     map.on("zoomend", triggerRefresh);
     map.on("load", loadPinsForView);
 
-    // Optional: nudge map toward the current image on first load
+    // Nudge map toward current image on first load
     viewer.on("image", async ()=>{
-      try{
+      try {
         const p = await viewer.getPosition();
         if (!map.getBounds().pad(-0.2).contains([p.lng,p.lat])) {
           map.easeTo({ center:[p.lng,p.lat], zoom: Math.max(map.getZoom(), MIN_ZOOM_FOR_PINS) });
         }
-      }catch{}
+      } catch {}
     });
   </script>
 </body>
