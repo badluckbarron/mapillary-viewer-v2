@@ -221,37 +221,58 @@
     }
 
     async function fetchTile(bbox, cap, signal){
-      let out = [];
-      let url = buildTileURL(bbox, Math.min(PAGE_LIMIT, cap));
-      while (url && out.length < cap) {
-        const res = await fetch(url, { signal });
-        if (!res.ok) {
-          const txt = await res.text().catch(()=>res.statusText);
-          throw new Error(txt || `HTTP ${res.status}`);
-        }
-        const j = await res.json();
-        const data = Array.isArray(j.data) ? j.data : [];
-        for (const d of data) {
-          const c = d?.computed_geometry?.coordinates;
-          const creatorName = d?.creator?.username || "";
-          if (!Array.isArray(c) || c.length !== 2) continue;
-          if (creatorName && creatorName !== USERNAME) continue;
-          out.push({ id:d.id, lng:c[0], lat:c[1] });
-          if (out.length >= cap) break;
-        }
-        const next = j?.paging?.next;
-        if (next && out.length < cap) {
-          url = new URL(next);
-          if (!url.searchParams.get("access_token"))      url.searchParams.set("access_token", TOKEN);
-          if (!url.searchParams.get("creator_username"))  url.searchParams.set("creator_username", USERNAME);
-          if (!url.searchParams.get("fields"))            url.searchParams.set("fields","id,computed_geometry,captured_at,creator");
-          if (!url.searchParams.get("start_captured_at")) url.searchParams.set("start_captured_at", CUTOFF_ISO);
-        } else {
-          url = null;
-        }
-      }
-      return out;
+  // Keep one clean bbox string we can re-attach on every page
+  const bboxStr = bbox.map(v => +v.toFixed(7)).join(',');
+  let out = [];
+
+  // First page
+  let url = new URL("https://graph.mapillary.com/images");
+  url.searchParams.set("fields", "id,computed_geometry,captured_at,creator");
+  url.searchParams.set("creator_username", USERNAME);
+  url.searchParams.set("start_captured_at", CUTOFF_ISO);
+  url.searchParams.set("bbox", bboxStr); // west,south,east,north
+  url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, cap)));
+  url.searchParams.set("access_token", TOKEN);
+
+  while (url && out.length < cap) {
+    const res = await fetch(url, { signal });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => res.statusText);
+      throw new Error(`${res.status} ${txt}`);
     }
+
+    const j = await res.json();
+    const data = Array.isArray(j.data) ? j.data : [];
+    for (const d of data) {
+      const c = d?.computed_geometry?.coordinates;
+      const creatorName = d?.creator?.username || "";
+      if (!Array.isArray(c) || c.length !== 2) continue;
+      if (creatorName && creatorName !== USERNAME) continue; // extra guard
+      out.push({ id: d.id, lng: c[0], lat: c[1] });
+      if (out.length >= cap) break;
+    }
+
+    // Follow next page, but PUT BACK the filters the API drops (especially bbox)
+    const next = j?.paging?.next;
+    if (next && out.length < cap) {
+      url = new URL(next);
+
+      // persist critical filters
+      if (!url.searchParams.get("access_token"))      url.searchParams.set("access_token", TOKEN);
+      if (!url.searchParams.get("creator_username"))  url.searchParams.set("creator_username", USERNAME);
+      if (!url.searchParams.get("fields"))            url.searchParams.set("fields", "id,computed_geometry,captured_at,creator");
+      if (!url.searchParams.get("start_captured_at")) url.searchParams.set("start_captured_at", CUTOFF_ISO);
+      if (!url.searchParams.get("bbox"))              url.searchParams.set("bbox", bboxStr);
+
+      // tighten the page size to only what we still need
+      const remaining = cap - out.length;
+      url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, remaining)));
+    } else {
+      url = null;
+    }
+  }
+  return out;
+}
 
     async function loadPinsForView(){
       if (map.getZoom() < MIN_ZOOM_FOR_PINS) {
