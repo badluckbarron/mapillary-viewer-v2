@@ -174,7 +174,7 @@
           if (f?.properties?.id) viewer.moveTo(String(f.properties.id)).catch(()=>{});
         });
         map.on("mouseenter","filtered-pins-dots",()=> map.getCanvas().style.cursor="pointer");
-        map.on("mouseleave","filtered-pins-dots",()=> map.getCanvas().style.cursor="";
+        map.on("mouseleave","filtered-pins-dots",()=> map.getCanvas().style.cursor="");
       }
     }
 
